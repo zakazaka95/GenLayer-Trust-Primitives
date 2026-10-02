@@ -10,11 +10,12 @@ import json
 from urllib.parse import urlparse
 
 
-CONTRACT_VERSION = "1.0.0"
-RECEIPT_SCHEMA = "claim-pulse-receipt-v1"
+CONTRACT_VERSION = "1.1.0"
+RECEIPT_SCHEMA = "claim-pulse-receipt-v2"
 MAX_SOURCES = 3
 MAX_SOURCE_BYTES = 12_000
-MAX_TOTAL_PROMPT_CHARS = 28_000
+# Includes phase rules, locked claim, delimiters and every complete source.
+MAX_TOTAL_PROMPT_CHARS = 40_000
 MAX_ATTEMPTS = 3
 RETRY_COOLDOWN_SECONDS = 60
 MIN_LEASE_SECONDS = 300
@@ -112,14 +113,22 @@ def _fetch_source(url: str) -> dict:
         response = gl.nondet.web.request(url, method="GET")
         status = _response_status(response)
         body = _response_bytes(response)
+        truncated = len(body) > MAX_SOURCE_BYTES
+        text = ""
+        error = ""
+        if not truncated:
+            try:
+                text = body.decode("utf-8")
+            except UnicodeDecodeError:
+                error = "SOURCE_NOT_UTF8"
         return {
             "url": url,
             "status": status,
             "bytes": len(body),
             "sha256": _hash_bytes(body),
-            "truncated": len(body) > MAX_SOURCE_BYTES,
-            "text": body[:MAX_SOURCE_BYTES].decode("utf-8", errors="replace"),
-            "error": "",
+            "truncated": truncated,
+            "text": text,
+            "error": error,
         }
     except Exception:
         return {
@@ -133,13 +142,16 @@ def _fetch_source(url: str) -> dict:
         }
 
 
-def _source_snapshots(sources: list) -> list:
+def _source_snapshots(sources: list, inspected: bool = False, prompt_truncated: bool = False) -> list:
     return [{
         "url": source["url"],
         "status": source["status"],
         "bytes": source["bytes"],
         "sha256": source["sha256"],
-        "truncated": source["truncated"],
+        "truncated": source["truncated"] or prompt_truncated,
+        "source_truncated": source["truncated"],
+        "prompt_truncated": prompt_truncated,
+        "inspected_bytes": source["bytes"] if inspected else 0,
         "error": source["error"],
     } for source in sources]
 
@@ -150,19 +162,17 @@ def _all_readable(sources: list) -> bool:
         and source["bytes"] > 0
         and bool(source["sha256"])
         and not source["truncated"]
+        and not source["error"]
         for source in sources
     )
 
 
 def _prompt(claim: dict, sources: list, phase: str) -> str:
     source_blocks = []
-    remaining = MAX_TOTAL_PROMPT_CHARS
     for index, source in enumerate(sources):
-        text = source["text"][:remaining]
-        remaining -= len(text)
         source_blocks.append(
             f"SOURCE {index} URL: {source['url']}\n"
-            f"SOURCE {index} CONTENT (UNTRUSTED DATA):\n{text}\nEND SOURCE {index}"
+            f"SOURCE {index} CONTENT (UNTRUSTED DATA):\n{source['text']}\nEND SOURCE {index}"
         )
     locked = _canonical({
         "claim": claim["claim"],
@@ -236,23 +246,23 @@ def _normalize(raw, phase: str) -> tuple:
 
 def _build_receipt(claim: dict, phase: str) -> dict:
     sources = [_fetch_source(url) for url in claim["urls"]]
-    snapshots = _source_snapshots(sources)
     previous_hash = claim.get("current_receipt_hash", "")
-    if not _all_readable(sources):
-        return {
-            "schema": RECEIPT_SCHEMA,
-            "claim_id": claim["id"],
-            "claim_hash": claim["claim_hash"],
-            "phase": phase,
-            "revision": int(claim["revision"]) + 1,
-            "previous_receipt_hash": previous_hash,
-            "source_snapshot_hash": _hash_text(_canonical(snapshots)),
-            "sources": snapshots,
-            "decision": "UNREADABLE",
-            "reason_code": "SOURCE_UNREADABLE_OR_TOO_LARGE",
-        }
-    raw = gl.nondet.exec_prompt(_prompt(claim, sources, phase), response_format="json")
-    decision, reason = _normalize(raw, phase)
+    prompt = ""
+    inspected = False
+    prompt_truncated = False
+    decision = "UNREADABLE"
+    reason = "SOURCE_UNREADABLE_OR_TOO_LARGE"
+    if _all_readable(sources):
+        # Never slice evidence to fit, for either baseline or recheck.
+        prompt = _prompt(claim, sources, phase)
+        prompt_truncated = len(prompt) > MAX_TOTAL_PROMPT_CHARS
+        if prompt_truncated:
+            reason = "PROMPT_BUDGET_EXCEEDED"
+        else:
+            raw = gl.nondet.exec_prompt(prompt, response_format="json")
+            decision, reason = _normalize(raw, phase)
+            inspected = True
+    snapshots = _source_snapshots(sources, inspected, prompt_truncated)
     return {
         "schema": RECEIPT_SCHEMA,
         "claim_id": claim["id"],
@@ -262,6 +272,12 @@ def _build_receipt(claim: dict, phase: str) -> dict:
         "previous_receipt_hash": previous_hash,
         "source_snapshot_hash": _hash_text(_canonical(snapshots)),
         "sources": snapshots,
+        "inspection": {
+            "complete": inspected,
+            "prompt_chars": len(prompt),
+            "max_prompt_chars": MAX_TOTAL_PROMPT_CHARS,
+            "prompt_sha256": _hash_text(prompt) if prompt else "",
+        },
         "decision": decision,
         "reason_code": reason,
     }
@@ -482,5 +498,7 @@ class ClaimPulse(gl.contract.Contract):
             "rejected": int(self.total_rejected),
             "unreadable_final": int(self.total_unreadable_final),
             "max_sources": MAX_SOURCES,
+            "max_source_bytes": MAX_SOURCE_BYTES,
+            "max_total_prompt_chars": MAX_TOTAL_PROMPT_CHARS,
             "max_attempts": MAX_ATTEMPTS,
         }
